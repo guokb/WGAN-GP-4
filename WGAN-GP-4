@@ -1,0 +1,324 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.io import loadmat, savemat
+from sklearn.cluster import KMeans
+import time
+from datetime import datetime as dt
+import pandas as pd
+import csv
+import torch
+import torchvision
+import torch.nn as nn
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import Normalizer
+from torch.utils.tensorboard import SummaryWriter  # 导入tensorboard
+from torch.optim.lr_scheduler import LambdaLR
+import seaborn as sns
+from matplotlib.pyplot import MultipleLocator
+import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
+df1 = pd.read_excel(r'C:\Users\hp\Desktop\总开关故障插值测试-三轮.xlsx',header=None)
+#数据载入类的构建
+class TrainDataset(torch.utils.data.Dataset):
+    def __init__(self, trainX):
+        self.trainX = trainX
+
+    def __len__(self):
+        return len(self.trainX)
+
+    def __getitem__(self, i):
+        return torch.FloatTensor(self.trainX[i])  # 必须转换成tensor类型的
+# 数据归一化
+scaler = MinMaxScaler(feature_range=(-1, 1))
+#scaler = StandardScaler()
+#scaler.fit(df1)
+X_s = scaler.fit_transform(df1)  # 对每一列归一化或标准化
+df2=pd.DataFrame(X_s,columns=df1.columns)
+#df2.to_excel('归一化数据.xlsx',index=False,header=None)
+train_radio = 0.8
+num_train = int(len(df2)*0.8)
+train_data = df2  # 取训练集  直接全部取了，在测试的时候不需要用到测试集数据 257*95*18
+test_data = df2[:(len(df2)-num_train)] # 取测试集
+CUDA = True if torch.cuda.is_available() else False
+latent_dim = 100  # 噪声量
+use_gpu = torch.cuda.is_available()
+batch_size = 32  # 一次加载64个数据
+# 读取训练集
+train_data = np.array(train_data)  # 需要转换成numpy类型，否则下面循环迭代不出来
+train_data = train_data.reshape(62,95,18)
+train_dataset = TrainDataset(train_data)
+dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True,pin_memory=CUDA)  # 一个batch_size为一组数据
+# 读取测试集
+test_data = np.array(test_data)  # 需要转换成numpy类型，否则下面循环迭代不出来
+test_dataset = TrainDataset(test_data)
+test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=True,pin_memory=CUDA)  # 一个batch_size为一组数据
+def calculate_gradient_penalty(discriminator, real_samples, fake_samples, device):
+    batch_size = real_samples.size(0)
+    alpha = torch.rand(batch_size, 1, 1).to(device)
+    interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
+    d_interpolates = discriminator(interpolates)
+    fake = torch.ones(batch_size, 1).to(device)
+    gradients = torch.autograd.grad(outputs=d_interpolates, inputs=interpolates,
+                                    grad_outputs=fake, create_graph=True, retain_graph=True)[0]
+    gradients = gradients.view(batch_size, -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return gradient_penalty
+#定义生成器
+class Generator(nn.Module):
+
+    def __init__(self):
+        super(Generator, self).__init__()
+
+        self.model = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            torch.nn.BatchNorm1d(128),
+            torch.nn.LeakyReLU(0.2,inplace=True),
+            nn.Linear(128, 256),
+            torch.nn.BatchNorm1d(256),
+            torch.nn.LeakyReLU(0.2,inplace=True),
+            nn.Linear(256, 512),
+            torch.nn.BatchNorm1d(512),
+            torch.nn.LeakyReLU(0.2,inplace=True),
+            nn.Linear(512, 1024),
+            torch.nn.BatchNorm1d(1024),
+            torch.nn.LeakyReLU(0.2,inplace=True),
+            nn.Linear(1024, 1710),  # 维度(batch_size,1710)
+            nn.Tanh(),
+        )
+
+
+    def forward(self, z):
+        # shape of z: [batchsize, latent_dim]
+
+        output = self.model(z)  # 将z传入model
+        data = output.reshape(z.shape[0],95,18)  # 三维，z.shape[0]是batch_size的维度
+
+        return data
+# 定义判别器
+class Discriminator(nn.Module):
+
+    def __init__(self):
+        super(Discriminator, self).__init__()
+
+        self.model = nn.Sequential(
+            nn.Linear(95*18, 512),
+            torch.nn.LeakyReLU(0.2,inplace=True),
+            #torch.nn.Dropout(p=0.5),
+            nn.Linear(512, 256),
+            torch.nn.LeakyReLU(0.2,inplace=True),
+            nn.Linear(256, 128),
+            torch.nn.LeakyReLU(0.2,inplace=True),
+            nn.Linear(128, 64),
+            torch.nn.LeakyReLU(0.2,inplace=True),
+            nn.Linear(64, 1),
+            #nn.Sigmoid(),
+        )
+
+
+    def forward(self, image):
+        # shape of image: [batchsize, 1, 28, 28]
+
+        prob = self.model(image.reshape(image.shape[0], -1))  # 两维，返回一个概率值
+
+        return prob
+generator = Generator()
+discriminator = Discriminator()
+
+g_optimizer = torch.optim.Adam(generator.parameters(), lr=1e-4, betas=(0.5, 0.999))
+d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=5e-4, betas=(0.5, 0.999))
+
+'''
+g_optimizer = torch.optim.RMSprop(generator.parameters(), lr=1e-6)
+d_optimizer = torch.optim.RMSprop(discriminator.parameters(), lr=1e-6)
+'''
+loss_fn = nn.BCELoss()
+labels_one = torch.ones(batch_size, 1)
+labels_zero = torch.zeros(batch_size, 1)
+if use_gpu:
+    print("use gpu for training")
+    generator = generator.cuda()
+    discriminator = discriminator.cuda()
+    loss_fn = loss_fn.cuda()
+    labels_one = labels_one.to("cuda")
+    labels_zero = labels_zero.to("cuda")
+# 训练过程  过拟合是在训练集上表示很差，在测试集表现良好  0.00005  不是次数的问题
+num_epoch = 4001
+real_list = []
+fake_list = []
+W_distance = []
+caseA1 = []
+caseA2 = []
+caseA3 = []
+caseV1 = []
+caseV2 = []
+caseV3 = []
+caseP = []
+caseV = []
+case_cun = []  # 储存数据
+caseFUZAI = []
+counter = 0
+a = 10
+D_writer = SummaryWriter("logss")
+G_writer = SummaryWriter("logs")
+#scheduler_1 = LambdaLR(g_optimizer, lr_lambda=lambda epoch: 1/(epoch+1),verbose = True)  # 学习率下降算法
+#scheduler_2 = LambdaLR(d_optimizer, lr_lambda=lambda epoch: 1/(epoch+1),verbose = True)
+#g_lr_scheduler = lr_scheduler.ExponentialLR(g_optimizer, gamma=0.9)
+#d_lr_scheduler = lr_scheduler.ExponentialLR(d_optimizer, gamma=0.9)  # 学习率指数衰减
+for epoch in range(num_epoch):
+    for x in dataloader:   # 判别器的训练次数可以考虑改一改，该成2效果变好了  也不一定，等会儿试一下次数  训练两次的电压情况是比较好的
+        gt_data = x  # real_data
+        batch_size1 = gt_data.shape[0]
+        for _ in range(5): 
+            z = torch.randn(batch_size1, latent_dim)
+            if use_gpu:
+                gt_data = gt_data.to("cuda")
+                z = z.to('cuda')
+            #对判别器计算损失
+            #real_loss = loss_fn(discriminator(gt_data), labels_one)
+            #fake_loss = loss_fn(discriminator(pred_data.detach()), labels_zero)
+            #z = torch.randn(batch_size, latent_dim)
+            #z = z.to('cuda')
+            fake_data = generator(z).detach()
+            #d_loss = (real_loss + fake_loss)
+            gp = calculate_gradient_penalty(discriminator, gt_data, fake_data, 'cuda')  # 损失函数惩罚项
+            d_loss = - torch.mean(discriminator(gt_data)) + torch.mean(discriminator(fake_data)) + a*gp
+            W_Distance = -d_loss  # W距离，这样不影响d_loss的梯度下降
+            #W_distance.append(W_Distance.cpu().detach())
+            D_writer.add_scalar('loss_D', W_Distance.item(), epoch)  # tensorboard判别器损失值可视化
+            # 观察real_loss与fake_loss，同时下降同时达到最小值，并且差不多大，说明D已经稳定了
+            d_optimizer.zero_grad()
+            d_loss.backward()
+            d_optimizer.step()
+        # 训练生成器
+        z = torch.randn(batch_size1, latent_dim)
+        z = z.to('cuda')
+        pred_data = generator(z)  # 生成的数据
+
+        #recons_loss = torch.abs(pred_data - gt_data).mean()
+        # 对生成器计算损失
+        #g_loss = recons_loss * 0.05 + loss_fn(discriminator(pred_data), labels_one)  # 用这个loss的效果会好一些
+        g_loss = -torch.mean(discriminator(pred_data))
+        G_writer.add_scalar('loss_G', g_loss.item(), epoch)  # tensorboard生成器损失值可视化
+        g_optimizer.zero_grad()
+        g_loss.backward()
+        g_optimizer.step()
+        #g_lr_scheduler.step() 
+        #d_lr_scheduler.step()
+    W_distance.append(W_Distance.cpu().detach())   
+    # 测试集
+    z_t = torch.randn(62, latent_dim)  # 噪声
+    if use_gpu:
+        #gt_data_test = gt_data_test.to("cuda")
+        z_t = z_t.to('cuda')
+        pred_data_test = generator(z_t)
+    
+    
+    if (epoch<=100):  # 在600次左右会有一次震荡，因此要设一个学习率衰减，判别器训练15次和10次效果类似，所以5次应该就够了，那应该是生成器训练效果不行
+        for p in g_optimizer.param_groups:
+            p['lr'] *= 0.99
+        for j in d_optimizer.param_groups:
+            j['lr'] *= 0.99
+ 
+    
+    '''
+    if (epoch==100):
+        for p in g_optimizer.param_groups:
+            p['lr'] *= 0.001
+        for j in d_optimizer.param_groups:
+            j['lr'] *= 0.001
+    '''
+   
+
+    if (epoch % 20 == 0) and (epoch != 0):
+        print('d的学习率是：',d_optimizer.param_groups[0]['lr'])
+        print('g的学习率是：',g_optimizer.param_groups[0]['lr'])
+        pred_data_test = pred_data_test.cpu().detach().numpy()  # 转换成numpy需要先从GPU转换至cpu类型
+        pred_data_test = pred_data_test.reshape(pred_data_test.shape[0]*pred_data_test.shape[1],18)
+        case = scaler.inverse_transform(pred_data_test)  # 反归一化
+        '''
+        for j in range(64*95):
+            if (case[j,0]<0):
+                case[j,0]=0
+            if (case[j,2]<0):
+                case[j,2]=0
+            if (case[j,4]<0):
+                case[j,4]=0
+            
+            
+            if (case[j,1]>=255):
+                case[j,1]=random.randrange(224,230)  # 落在这个区间里
+            if (case[j,3]>=255):
+                case[j,3]=random.randrange(224,230)
+            if (case[j,5]>=255):
+                case[j,5]=random.randrange(224,230)
+        '''
+            
+        case = pd.DataFrame(case)
+        case_cun.append(case)
+        case.to_csv('生成数据测试1.csv', mode='a',header=False, index=False, encoding='utf_8_sig')
+            
+        case_A1 = case.iloc[:,0]  # 获取不同列的数据
+        caseA1.append(case_A1)
+        case_A2 = case.iloc[:,2]
+        caseA2.append(case_A2)
+        case_A3 = case.iloc[:,4]
+        caseA3.append(case_A3)
+        case_V1 = case.iloc[:,1]  
+        caseV1.append(case_V1)
+        case_V2 = case.iloc[:,3]
+        caseV2.append(case_V2)
+        case_V3 = case.iloc[:,5]
+        caseV3.append(case_V3)
+        case_P =case.iloc[:,7]
+        caseP.append(case_P)
+        case_V =case.iloc[:,8]
+        caseV.append(case_V)
+        case_FUZAI = case.iloc[:,6]
+        caseFUZAI.append(case_FUZAI)
+        #case.to_csv('生成数据测试.csv', mode='a',header=False, index=False, encoding='utf_8_sig')
+G_writer.close()
+D_writer.close()
+#loss曲线
+W_distance = np.array(W_distance)
+W_distance = pd.DataFrame(W_distance)
+plt.plot(W_distance,linewidth=0.8)
+plt.ylim(0,30)
+plt.xlim(-1,2000)
+plt.xlabel('Epoch')
+plt.ylabel('W-Distance')
+case1 = pd.DataFrame(caseA1)  
+case2 = case1
+case2 = np.array(case2)
+case2 = case2.reshape(200,62*95)
+case2 = pd.DataFrame(case2)
+case2 = case2.reset_index(drop=True)
+fig2 = plt.figure()
+#ax1 = fig2.add_subplot(211)
+for i in range(len(case2)):
+    print('图：',i)
+    case_3 = case2.iloc[i]
+    plt.xlim(-2,7)
+    plt.ylim(0,2)
+    sns.distplot(case2.iloc[i],hist=True,kde=True,  # 开启核密度曲线kernel density estimate (KDE)
+                     kde_kws={'linestyle': '--', 'linewidth': '1', 'color': '#c72e29',
+                              # 设置外框线属性
+                              },
+                     #fit=norm,
+                     color='#098154',
+                     axlabel='Value of A-phase Voltage',  # 设置x轴标题
+
+                     )
+    df5 = df1.iloc[:,0]
+    #ax2 = fig2.add_subplot(212)
+    sns.distplot(df5,hist=True,kde=True,  # 开启核密度曲线kernel density estimate (KDE)
+                     kde_kws={'linestyle': '--', 'linewidth': '1', 'color': '#c72e29',
+                              # 设置外框线属性
+                              },
+                     #fit=norm,
+                     color='#098154',
+                     axlabel='Value of A-phase Voltage',  # 设置x轴标题
+
+                     )
+    plt.show()
